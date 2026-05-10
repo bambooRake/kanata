@@ -39,6 +39,23 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::SyncSender as Sender;
 use std::time::{Duration, Instant};
 
+/// Drag-assist state: set true while the synthesized mouse button is held by
+/// kanata output. The mouse-event-tap reads these on every physical
+/// MouseMoved and synthesizes a matching MouseDragged so that drag gestures
+/// (kanata-down + physical-trackpad-move) compose correctly. Side buttons
+/// (Backward = HID#4, Forward = HID#5) ride on OtherMouseDragged with the
+/// MOUSE_EVENT_BUTTON_NUMBER field overridden, mirroring the synthesis
+/// path in `button_action`.
+static DRAG_LEFT_HELD: AtomicBool = AtomicBool::new(false);
+static DRAG_RIGHT_HELD: AtomicBool = AtomicBool::new(false);
+static DRAG_MID_HELD: AtomicBool = AtomicBool::new(false);
+static DRAG_BACKWARD_HELD: AtomicBool = AtomicBool::new(false);
+static DRAG_FORWARD_HELD: AtomicBool = AtomicBool::new(false);
+/// Last clickState stamped on a kanata-synthesized button down, reused on
+/// every drag-assist Dragged event so WindowServer keeps the gesture in the
+/// same click sequence (single drag, double-click drag, …).
+static DRAG_CLICK_STATE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1);
+
 /// Mouse `OsCode`s that, when present in `MAPPED_KEYS`, justify installing the
 /// CGEventTap. Used both as the startup/reload install gate and as the set of
 /// codes the tap can produce.
@@ -933,6 +950,10 @@ impl TryFrom<KeyEvent> for InputEvent {
 #[cfg(all(not(feature = "simulated_output"), not(feature = "passthru_ahk")))]
 pub struct KbdOut {
     output_pressed_since: HashMap<OsCode, Instant>,
+    /// Last left-click down timestamp + running clickCount, used to populate
+    /// `kCGMouseEventClickState` so WindowServer recognizes double/triple clicks.
+    /// Tracked per-button.
+    last_click: HashMap<Btn, (Instant, i64)>,
 }
 
 /// Treat a sink-disconnect from the processing thread as a non-fatal drop.
@@ -962,6 +983,7 @@ impl KbdOut {
     pub fn new() -> Result<Self, io::Error> {
         Ok(KbdOut {
             output_pressed_since: HashMap::default(),
+            last_click: HashMap::default(),
         })
     }
 
@@ -1186,8 +1208,47 @@ impl KbdOut {
             event.set_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER, num);
         }
 
+        // Compute and stamp clickCount so WindowServer recognizes
+        // double/triple clicks. Only updated on down; up reuses the count.
+        // Threshold matches NSEvent.doubleClickInterval default (~500ms).
+        let click_count = if is_click {
+            const DBL_CLICK_WINDOW: Duration = Duration::from_millis(500);
+            let now = Instant::now();
+            let entry = self.last_click.entry(btn).or_insert((now, 0));
+            let count = if now.duration_since(entry.0) <= DBL_CLICK_WINDOW {
+                entry.1 + 1
+            } else {
+                1
+            };
+            *entry = (now, count);
+            count
+        } else {
+            self.last_click.get(&btn).map(|(_, c)| *c).unwrap_or(1)
+        };
+        event.set_integer_value_field(EventField::MOUSE_EVENT_CLICK_STATE, click_count);
+
         // Mouse control only seems to work with CGEventTapLocation::HID.
         event.post(CGEventTapLocation::HID);
+
+        // Drag-assist (Plan G): keep a flag so the mouse-event-tap can
+        // synthesize Dragged events on physical trackpad movement while
+        // a kanata-driven button is held.
+        let flag = match btn {
+            Btn::Left => Some(&DRAG_LEFT_HELD),
+            Btn::Right => Some(&DRAG_RIGHT_HELD),
+            Btn::Mid => Some(&DRAG_MID_HELD),
+            Btn::Backward => Some(&DRAG_BACKWARD_HELD),
+            Btn::Forward => Some(&DRAG_FORWARD_HELD),
+        };
+        if let Some(f) = flag {
+            f.store(is_click, Ordering::Release);
+            if is_click {
+                DRAG_CLICK_STATE.store(click_count, Ordering::Release);
+            }
+        }
+        log::debug!(
+            "drag-assist: button_action btn={btn:?} is_click={is_click} click_count={click_count}"
+        );
         Ok(())
     }
 
@@ -1394,15 +1455,18 @@ pub fn start_mouse_listener(
          the previously stashed Arc would be silently kept"
     );
 
+    // Always install the tap. Upstream gates installation on whether
+    // defsrc maps mouse keys (or a mouse-movement-key is configured),
+    // but this fork also uses the tap to translate physical MouseMoved
+    // into MouseDragged while a kanata-synthesized button is held —
+    // that path needs the tap regardless of input-side mapping. We
+    // still compute the upstream conditions so the install reason is
+    // visible in logs.
     let has_mouse_keys = MOUSE_OSCODES.iter().any(|c| mapped_keys.contains(c));
     let has_movement_key = mouse_movement_key.lock().is_some();
-    if !has_mouse_keys && !has_movement_key {
-        log::info!(
-            "No mouse buttons/wheel in defsrc and no mouse-movement-key configured. \
-             Not installing mouse event tap."
-        );
-        return None;
-    }
+    log::info!(
+        "Installing mouse event tap (mouse_keys={has_mouse_keys}, movement_key={has_movement_key}, drag_assist=always)"
+    );
 
     // Claim the install slot atomically *before* spawning. Closes the race
     // where a live reload could observe `MOUSE_TAP_INSTALLED == false` between
@@ -1461,6 +1525,59 @@ pub fn start_mouse_listener(
                             | CGEventType::RightMouseDragged
                             | CGEventType::OtherMouseDragged
                     ) {
+                        // Drag-assist: if a kanata-driven button is held,
+                        // synthesize a matching Dragged event at the current
+                        // cursor location so apps that rely on Dragged (vs
+                        // plain MouseMoved) see the gesture. WindowServer
+                        // does not auto-promote MouseMoved → Dragged across
+                        // event sources, so we have to do it ourselves.
+                        if matches!(event_type, CGEventType::MouseMoved) {
+                            // (event_type, placeholder_button, optional_button_number_override)
+                            // For Backward/Forward we ride on OtherMouseDragged
+                            // and override MOUSE_EVENT_BUTTON_NUMBER, mirroring
+                            // the synthesis path used in `button_action`.
+                            // Always stamp MOUSE_EVENT_BUTTON_NUMBER explicitly
+                            // (CGEvent values are 0-indexed: Left=0, Right=1,
+                            // Mid=2, Backward=3, Forward=4).
+                            let drag_target = if DRAG_LEFT_HELD.load(Ordering::Acquire) {
+                                Some((CGEventType::LeftMouseDragged, CGMouseButton::Left, 0i64))
+                            } else if DRAG_RIGHT_HELD.load(Ordering::Acquire) {
+                                Some((CGEventType::RightMouseDragged, CGMouseButton::Right, 1i64))
+                            } else if DRAG_MID_HELD.load(Ordering::Acquire) {
+                                Some((CGEventType::OtherMouseDragged, CGMouseButton::Center, 2i64))
+                            } else if DRAG_BACKWARD_HELD.load(Ordering::Acquire) {
+                                Some((CGEventType::OtherMouseDragged, CGMouseButton::Center, 3i64))
+                            } else if DRAG_FORWARD_HELD.load(Ordering::Acquire) {
+                                Some((CGEventType::OtherMouseDragged, CGMouseButton::Center, 4i64))
+                            } else {
+                                None
+                            };
+                            if let Some((dtype, dbutton, dnumber)) = drag_target {
+                                if let Ok(src) =
+                                    CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+                                {
+                                    let pos = event.location();
+                                    if let Ok(drag) =
+                                        CGEvent::new_mouse_event(src, dtype, pos, dbutton)
+                                    {
+                                        drag.set_integer_value_field(
+                                            EventField::MOUSE_EVENT_BUTTON_NUMBER,
+                                            dnumber,
+                                        );
+                                        drag.set_integer_value_field(
+                                            EventField::MOUSE_EVENT_CLICK_STATE,
+                                            DRAG_CLICK_STATE.load(Ordering::Acquire),
+                                        );
+                                        log::trace!(
+                                            "drag-assist: post Dragged button={dnumber} pos=({:.0},{:.0})",
+                                            pos.x, pos.y
+                                        );
+                                        drag.post(CGEventTapLocation::HID);
+                                    }
+                                }
+                            }
+                        }
+
                         // The Arc is stashed before this tap is created, so
                         // `get()` is `Some` in practice. Fall back to a plain
                         // pass-through if not, rather than panicking on the
