@@ -1271,6 +1271,48 @@ impl KbdOut {
     /// [1]: https://developer.apple.com/documentation/coregraphics/cgevent/init(mouseeventsource:mousetype:mousecursorposition:mousebutton:)
     /// [2]: https://developer.apple.com/documentation/coregraphics/cgevent/setintegervaluefield(_:value:)
     fn button_action(&mut self, btn: Btn, is_click: bool) -> Result<(), io::Error> {
+        // Preferred path: inject the button through the Karabiner
+        // VirtualHIDDevice pointing device so it is a *real* HID event.
+        // CGEvent-synthesized buttons — even with an HID-system source state —
+        // are invisible to consumers that read below the CGEvent layer, notably
+        // BetterTouchTool's window-snap detection, which only arms for genuine
+        // HID pointing input (confirmed: a physical mouse/trackpad triggers it,
+        // a CGEvent-synthesized click does not). A real HID button held during
+        // physical trackpad motion makes WindowServer emit a true drag, so this
+        // is what lets BTT snap areas react to kanata drags.
+        //
+        // We still keep the DRAG_*_HELD flags in sync (below) so the CGEvent
+        // drag-assist path remains a fallback if WindowServer ever delivers a
+        // bare MouseMoved instead of a Dragged while the button is held.
+        if is_pointing_ready() {
+            // HID button numbers are 1-indexed: 1=L, 2=R, 3=Mid, 4=Back, 5=Fwd.
+            let hid_button: u8 = match btn {
+                Btn::Left => 1,
+                Btn::Right => 2,
+                Btn::Mid => 3,
+                Btn::Backward => 4,
+                Btn::Forward => 5,
+            };
+            if is_click {
+                pointing_button_press(hid_button);
+            } else {
+                pointing_button_release(hid_button);
+            }
+            let flag = match btn {
+                Btn::Left => &DRAG_LEFT_HELD,
+                Btn::Right => &DRAG_RIGHT_HELD,
+                Btn::Mid => &DRAG_MID_HELD,
+                Btn::Backward => &DRAG_BACKWARD_HELD,
+                Btn::Forward => &DRAG_FORWARD_HELD,
+            };
+            flag.store(is_click, Ordering::Release);
+            log::debug!(
+                "pointing button: btn={btn:?} hid_button={hid_button} is_click={is_click}"
+            );
+            return Ok(());
+        }
+
+        // Fallback: pointing sink not ready — synthesize via CGEvent.
         // (event_type, placeholder_button, real_button_number_override)
         let (event_type, button, button_number) = match btn {
             Btn::Left => (
@@ -1322,7 +1364,9 @@ impl KbdOut {
             ),
         };
 
-        let event_source = Self::make_event_source()?;
+        // Use the HID-system source so BTT (and similar) treat this
+        // synthesized button as a real hardware click / drag start.
+        let event_source = Self::make_event_source_hid()?;
         let event = Self::make_event()?;
         let mouse_position = event.location();
         let event = CGEvent::new_mouse_event(event_source, event_type, mouse_position, button)
@@ -1387,12 +1431,27 @@ impl KbdOut {
     pub fn move_mouse(&mut self, mv: CalculatedMouseMove) -> Result<(), io::Error> {
         let pressed = Self::pressed_buttons();
 
-        let event_type = if pressed & 1 > 0 {
-            CGEventType::LeftMouseDragged
+        // When a button is held this is a drag; also pick the CGEvent button
+        // number so the synthesized Dragged event can carry it.
+        let (event_type, button_number) = if pressed & 1 > 0 {
+            (CGEventType::LeftMouseDragged, Some(0i64))
         } else if pressed & 2 > 0 {
-            CGEventType::RightMouseDragged
+            (CGEventType::RightMouseDragged, Some(1i64))
         } else {
-            CGEventType::MouseMoved
+            (CGEventType::MouseMoved, None)
+        };
+
+        // Delta this move applies. A freshly created CGEvent carries
+        // deltaX/deltaY = 0; consumers that key on drag *deltas* (e.g.
+        // BetterTouchTool snap-area detection) never see motion without it,
+        // even though the window itself follows because AppKit uses the
+        // absolute location. Mirrors the drag-assist rewrite path which
+        // preserves the physical event's deltas.
+        let (dx, dy): (i64, i64) = match mv.direction {
+            MoveDirection::Up => (0, -(mv.distance as i64)),
+            MoveDirection::Down => (0, mv.distance as i64),
+            MoveDirection::Left => (-(mv.distance as i64), 0),
+            MoveDirection::Right => (mv.distance as i64, 0),
         };
 
         let event = Self::make_event()?;
@@ -1404,6 +1463,17 @@ impl KbdOut {
             mouse_position,
             CGMouseButton::Left,
         ) {
+            // Only a drag needs the delta/click-state/button-number stamps; a
+            // bare MouseMoved (no button held) does not.
+            if let Some(num) = button_number {
+                event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_X, dx);
+                event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y, dy);
+                event.set_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER, num);
+                event.set_integer_value_field(
+                    EventField::MOUSE_EVENT_CLICK_STATE,
+                    DRAG_CLICK_STATE.load(Ordering::Acquire),
+                );
+            }
             event.post(CGEventTapLocation::HID);
         }
         Ok(())
@@ -1441,6 +1511,20 @@ impl KbdOut {
 
     fn make_event_source() -> Result<CGEventSource, Error> {
         CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
+            .map_err(|_| Error::other("failed to create core graphics event source"))
+    }
+
+    /// Like `make_event_source` but reports `HIDSystemState` as the event's
+    /// source state — the same state real hardware events carry. Some apps
+    /// distinguish "real" from "synthetic" input by this field: notably
+    /// BetterTouchTool's window-snap detection only arms when a mouse-down
+    /// looks like a genuine hardware drag gesture. A `CombinedSessionState`
+    /// (ID 0) source marks the event as synthetic and BTT never treats it as
+    /// a drag start; `HIDSystemState` (ID 1) makes the synthesized button
+    /// indistinguishable from a physical click for those consumers. Used only
+    /// for mouse buttons — keyboard events keep the combined-session source.
+    fn make_event_source_hid() -> Result<CGEventSource, Error> {
+        CGEventSource::new(CGEventSourceStateID::HIDSystemState)
             .map_err(|_| Error::other("failed to create core graphics event source"))
     }
     /// Creates a core graphics event.
@@ -1650,55 +1734,63 @@ pub fn start_mouse_listener(
                             | CGEventType::OtherMouseDragged
                     ) {
                         // Drag-assist: if a kanata-driven button is held,
-                        // synthesize a matching Dragged event at the current
-                        // cursor location so apps that rely on Dragged (vs
-                        // plain MouseMoved) see the gesture. WindowServer
-                        // does not auto-promote MouseMoved → Dragged across
-                        // event sources, so we have to do it ourselves.
+                        // rewrite this physical MouseMoved *in place* into the
+                        // matching Dragged event, then pass that single event
+                        // through.
+                        //
+                        // The earlier approach posted a *separate* synthesized
+                        // Dragged and still forwarded the bare MouseMoved. That
+                        // works in native AppKit (its drag loop only consumes
+                        // Dragged/Up and ignores the stray Moved) but breaks in
+                        // Chromium/Electron: blink translates each NSEvent
+                        // independently, so an interleaved no-button MouseMoved
+                        // between Dragged events reads as the button bouncing
+                        // up→down and shatters a fine drag into repeated clicks
+                        // (the "連続発火" symptom). Emitting exactly one event
+                        // per physical move, already typed as Dragged, gives
+                        // both stacks the clean Dragged-only stream a drag
+                        // expects.
+                        //
+                        // Rewriting in place (vs new_mouse_event) also preserves
+                        // the physical event's deltaX/deltaY, pressure, etc. — a
+                        // freshly synthesized event carries no deltas, which some
+                        // drag handlers rely on. WindowServer does not
+                        // auto-promote MouseMoved → Dragged across event sources,
+                        // so we do the promotion ourselves.
                         if matches!(event_type, CGEventType::MouseMoved) {
-                            // (event_type, placeholder_button, optional_button_number_override)
-                            // For Backward/Forward we ride on OtherMouseDragged
-                            // and override MOUSE_EVENT_BUTTON_NUMBER, mirroring
-                            // the synthesis path used in `button_action`.
-                            // Always stamp MOUSE_EVENT_BUTTON_NUMBER explicitly
-                            // (CGEvent values are 0-indexed: Left=0, Right=1,
-                            // Mid=2, Backward=3, Forward=4).
+                            // (Dragged type, MOUSE_EVENT_BUTTON_NUMBER override).
+                            // CGEvent button numbers are 0-indexed: Left=0,
+                            // Right=1, Mid=2, Backward=3, Forward=4. Side buttons
+                            // ride on OtherMouseDragged with the number
+                            // overridden, mirroring the path in `button_action`.
                             let drag_target = if DRAG_LEFT_HELD.load(Ordering::Acquire) {
-                                Some((CGEventType::LeftMouseDragged, CGMouseButton::Left, 0i64))
+                                Some((CGEventType::LeftMouseDragged, 0i64))
                             } else if DRAG_RIGHT_HELD.load(Ordering::Acquire) {
-                                Some((CGEventType::RightMouseDragged, CGMouseButton::Right, 1i64))
+                                Some((CGEventType::RightMouseDragged, 1i64))
                             } else if DRAG_MID_HELD.load(Ordering::Acquire) {
-                                Some((CGEventType::OtherMouseDragged, CGMouseButton::Center, 2i64))
+                                Some((CGEventType::OtherMouseDragged, 2i64))
                             } else if DRAG_BACKWARD_HELD.load(Ordering::Acquire) {
-                                Some((CGEventType::OtherMouseDragged, CGMouseButton::Center, 3i64))
+                                Some((CGEventType::OtherMouseDragged, 3i64))
                             } else if DRAG_FORWARD_HELD.load(Ordering::Acquire) {
-                                Some((CGEventType::OtherMouseDragged, CGMouseButton::Center, 4i64))
+                                Some((CGEventType::OtherMouseDragged, 4i64))
                             } else {
                                 None
                             };
-                            if let Some((dtype, dbutton, dnumber)) = drag_target {
-                                if let Ok(src) =
-                                    CGEventSource::new(CGEventSourceStateID::HIDSystemState)
-                                {
-                                    let pos = event.location();
-                                    if let Ok(drag) =
-                                        CGEvent::new_mouse_event(src, dtype, pos, dbutton)
-                                    {
-                                        drag.set_integer_value_field(
-                                            EventField::MOUSE_EVENT_BUTTON_NUMBER,
-                                            dnumber,
-                                        );
-                                        drag.set_integer_value_field(
-                                            EventField::MOUSE_EVENT_CLICK_STATE,
-                                            DRAG_CLICK_STATE.load(Ordering::Acquire),
-                                        );
-                                        log::trace!(
-                                            "drag-assist: post Dragged button={dnumber} pos=({:.0},{:.0})",
-                                            pos.x, pos.y
-                                        );
-                                        drag.post(CGEventTapLocation::HID);
-                                    }
-                                }
+                            if let Some((dtype, dnumber)) = drag_target {
+                                event.set_type(dtype);
+                                event.set_integer_value_field(
+                                    EventField::MOUSE_EVENT_BUTTON_NUMBER,
+                                    dnumber,
+                                );
+                                event.set_integer_value_field(
+                                    EventField::MOUSE_EVENT_CLICK_STATE,
+                                    DRAG_CLICK_STATE.load(Ordering::Acquire),
+                                );
+                                log::trace!(
+                                    "drag-assist: rewrite MouseMoved -> Dragged button={dnumber} pos=({:.0},{:.0})",
+                                    event.location().x,
+                                    event.location().y
+                                );
                             }
                         }
 
